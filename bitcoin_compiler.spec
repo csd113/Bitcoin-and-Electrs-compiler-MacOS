@@ -13,7 +13,7 @@ from PyInstaller.utils.hooks import collect_data_files
 block_cipher = None
 
 a = Analysis(
-    ['compile_bitcoind_gui_fixed.py'],
+    ['compile_bitcoind_gui.py'],
     pathex=[],
     binaries=[],
     datas=[],
