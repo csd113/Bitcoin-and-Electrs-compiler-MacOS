@@ -72,7 +72,7 @@ The app can automatically install the following via Homebrew:
    cd bitcoin-and-electrs-compiler-macos
    ```
 
-###1. Make sure you have the files
+### 1. Make sure you have the files
 Should see:
    - compile_bitcoind_gui.py
      
