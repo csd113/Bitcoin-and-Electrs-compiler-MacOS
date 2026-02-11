@@ -40,7 +40,9 @@ os.environ["PATH"] = (
 
 # ================== CONFIG ==================
 BITCOIN_API = "https://api.github.com/repos/bitcoin/bitcoin/releases"
+BITCOIN_REPO = "https://github.com/bitcoin/bitcoin.git"
 ELECTRS_API = "https://api.github.com/repos/romanz/electrs/releases"
+ELECTRS_REPO = "https://github.com/romanz/electrs.git"
 DEFAULT_BUILD_DIR = os.path.expanduser("~/Downloads/bitcoin_builds")
 
 # ================== HOMEBREW DETECTION ==================
@@ -385,9 +387,10 @@ def check_dependencies():
 
             # Required Homebrew packages (excluding rust, we check that separately)
             # Note: berkeley-db@4 is only needed for wallet support, not for running a node
+            # Added git to the list of required packages
             brew_packages = [
                 "automake", "libtool", "pkg-config", "boost",
-                "miniupnpc", "zeromq", "sqlite", "python", "cmake", "llvm", "libevent", "rocksdb", "rust"
+                "miniupnpc", "zeromq", "sqlite", "python", "cmake", "llvm", "libevent", "rocksdb", "rust", "git"
             ]
 
             log("\nChecking Homebrew packages...\n")
@@ -557,7 +560,7 @@ def copy_binaries(src_dir, dest_dir, binary_files):
     return copied
 
 def compile_bitcoin_source(version, build_dir, cores):
-    """Compile Bitcoin Core from source"""
+    """Compile Bitcoin Core from source using git clone"""
     try:
         log(f"\n{'='*60}\n")
         log(f"COMPILING BITCOIN CORE {version}\n")
@@ -569,19 +572,20 @@ def compile_bitcoin_source(version, build_dir, cores):
         # Create build directory
         os.makedirs(build_dir, exist_ok=True)
         
-        # Download source if not exists
+        # Clone or update source from GitHub
         if not os.path.exists(src_dir):
-            log(f"\n📥 Downloading Bitcoin Core {version}...\n")
-            tarball = f"bitcoin-{version_clean}.tar.gz"
+            log(f"\n📥 Cloning Bitcoin Core repository...\n")
             run_command(
-                f"curl -L https://github.com/bitcoin/bitcoin/archive/refs/tags/{version}.tar.gz -o {tarball}",
+                f"git clone --depth 1 --branch {version} {BITCOIN_REPO} {src_dir}",
                 cwd=build_dir
             )
-            log(f"\n📦 Extracting {tarball}...\n")
-            run_command(f"tar xzf {tarball}", cwd=build_dir)
-            log(f"✓ Source extracted to {src_dir}\n")
+            log(f"✓ Source cloned to {src_dir}\n")
         else:
             log(f"✓ Source directory already exists: {src_dir}\n")
+            log(f"📥 Updating to {version}...\n")
+            run_command(f"git fetch --depth 1 origin tag {version}", cwd=src_dir)
+            run_command(f"git checkout {version}", cwd=src_dir)
+            log(f"✓ Updated to {version}\n")
 
         # Setup environment
         env = setup_build_environment()
@@ -668,7 +672,7 @@ def compile_bitcoin_source(version, build_dir, cores):
         raise
 
 def compile_electrs_source(version, build_dir, cores):
-    """Compile Electrs from source"""
+    """Compile Electrs from source using git clone"""
     try:
         log(f"\n{'='*60}\n")
         log(f"COMPILING ELECTRS {version}\n")
@@ -722,20 +726,21 @@ def compile_electrs_source(version, build_dir, cores):
         # Create build directory
         os.makedirs(build_dir, exist_ok=True)
         
-        # Download source if not exists
+        # Clone or update source from GitHub
         if not os.path.exists(src_dir):
-            log(f"\n📥 Downloading Electrs {version}...\n")
-            tarball = f"electrs-{version_clean}.tar.gz"
+            log(f"\n📥 Cloning Electrs repository...\n")
             run_command(
-                f"curl -L https://github.com/romanz/electrs/archive/refs/tags/{version}.tar.gz -o {tarball}",
+                f"git clone --depth 1 --branch {version} {ELECTRS_REPO} {src_dir}",
                 cwd=build_dir,
                 env=env
             )
-            log(f"\n📦 Extracting {tarball}...\n")
-            run_command(f"tar xzf {tarball}", cwd=build_dir, env=env)
-            log(f"✓ Source extracted to {src_dir}\n")
+            log(f"✓ Source cloned to {src_dir}\n")
         else:
             log(f"✓ Source directory already exists: {src_dir}\n")
+            log(f"📥 Updating to {version}...\n")
+            run_command(f"git fetch --depth 1 origin tag {version}", cwd=src_dir, env=env)
+            run_command(f"git checkout {version}", cwd=src_dir, env=env)
+            log(f"✓ Updated to {version}\n")
         
         log(f"\n🔧 Building with Cargo ({cores} jobs)...\n")
         log(f"Environment details:\n")
@@ -1019,6 +1024,7 @@ def create_gui():
         log(f"Running as: PyInstaller Bundle\n")
     log("=" * 60 + "\n\n")
     log("👉 Click 'Check & Install Dependencies' to begin\n\n")
+    log("📝 Note: Both Bitcoin and Electrs now pull source from GitHub\n\n")
     
     # Load versions after GUI is ready
     root.after(100, initial_version_load)
