@@ -2,6 +2,12 @@
 
 A native macOS application that simplifies the process of compiling Bitcoin Core and Electrs from source. Built with Python and Tkinter, this app provides a user-friendly GUI to build production-ready Bitcoin node software on your Mac.
 
+## Single command to clone and compile
+
+```
+git clone https://github.com/csd113/Bitcoin-and-Electrs-compiler-MacOS.git && cd Bitcoin-and-Electrs-compiler-MacOS && chmod +x build_app.sh && ./build_app.sh
+```
+
 ## ✨ Features
 
 - **One-Click Setup** - Automatically checks and installs all required dependencies via Homebrew
