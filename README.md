@@ -5,7 +5,7 @@ python based app that checks dependancies and is able to auto compile both bitco
 # How to install:
  1. Make sure you have the files
 ### Should see:
-   compile_bitcoind_gui_fixed.py
+   compile_bitcoind_gui.py
    bitcoin_compiler.spec
    build_app.sh
 
@@ -53,5 +53,5 @@ pyinstaller \
     --noconfirm \
     --clean \
     --osx-bundle-identifier com.bitcointools.compiler \
-    compile_bitcoind_gui_fixed.py
+    compile_bitcoind_gui.py
 ```
