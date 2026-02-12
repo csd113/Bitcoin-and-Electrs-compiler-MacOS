@@ -5,7 +5,7 @@ A native macOS application that simplifies the process of compiling Bitcoin Core
 ## Single command to clone and compile
 
 ```
-git clone https://github.com/csd113/Bitcoin-and-Electrs-compiler-MacOS.git && cd Bitcoin-and-Electrs-compiler-MacOS && chmod +x build.sh && ./build.sh
+git clone https://github.com/csd113/Bitcoin-And-Electrs-GUI-Compiler-For-MacOS.git && cd Bitcoin-And-Electrs-GUI-Compiler-For-MacOS && chmod +x build.sh && ./build.sh
 ```
 
 ## ✨ Features
