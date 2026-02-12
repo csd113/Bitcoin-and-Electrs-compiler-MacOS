@@ -67,7 +67,7 @@ coll = COLLECT(
 
 app = BUNDLE(
     coll,
-    name='Bitforge.app',
+    name='BitForge.app',
     icon='image.icns',
     bundle_identifier='com.bitcoin.electrs.compiler',
 )
