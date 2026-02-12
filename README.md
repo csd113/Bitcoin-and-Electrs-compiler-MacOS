@@ -1,4 +1,4 @@
-# Bitcoin & Electrs Compiler for macOS
+# BitForge Python is a GUI based Bitcoin & Electrs binary Compiler for macOS written in Python
 
 A native macOS application that simplifies the process of compiling Bitcoin Core and Electrs from source. Built with Python and Tkinter, this app provides a user-friendly GUI to build production-ready Bitcoin node software on your Mac.
 
