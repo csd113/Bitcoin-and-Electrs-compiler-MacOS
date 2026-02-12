@@ -2,8 +2,34 @@
 
 A native macOS application that simplifies the process of compiling Bitcoin Core and Electrs from source. Built with Python and Tkinter, this app provides a user-friendly GUI to build production-ready Bitcoin node software on your Mac.
 
-## Single command to clone and compile
+## Easy App Build Steps
 
+### Homebrew
+```
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+### XXcode Command Line Tools
+```
+xcode-select --install
+```
+
+### Git via brew
+```
+brew install git
+```
+
+### Python via brew
+```
+brew install python
+```
+
+### Pyinstaller
+```
+pip3 install pyinstaller
+```
+
+### Build the BitForge App
 ```
 git clone https://github.com/csd113/BitForge-Python.git && cd BitForge-Python && chmod +x build.sh && ./build.sh
 ```
