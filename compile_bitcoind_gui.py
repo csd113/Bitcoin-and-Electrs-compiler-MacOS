@@ -57,7 +57,34 @@ def get_architecture():
     else:
         return "unknown"
 
+def get_chip_name():
+    """Get the specific M-series chip name for Apple Silicon"""
+    if platform.system() != 'Darwin':
+        return None
+    
+    try:
+        # Try to get CPU brand string from sysctl
+        result = subprocess.run(
+            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5
+        )
+        
+        if result.returncode == 0:
+            brand = result.stdout.strip()
+            # Extract M1, M2, M3, etc. from "Apple M1" or similar
+            m = re.search(r'Apple (M\d+(?:\s+(?:Pro|Max|Ultra))?)', brand, re.IGNORECASE)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    
+    return None
+
 ARCH = get_architecture()
+CHIP_NAME = get_chip_name()
 
 # ================== HOMEBREW DETECTION ==================
 def find_brew():
@@ -100,7 +127,8 @@ def verify_git_commit(repo_dir, expected_tag):
             cwd=repo_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
+            timeout=30
         )
         
         if result.returncode != 0:
@@ -115,7 +143,8 @@ def verify_git_commit(repo_dir, expected_tag):
             cwd=repo_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
+            timeout=30
         )
         
         if result.returncode != 0:
@@ -134,6 +163,9 @@ def verify_git_commit(repo_dir, expected_tag):
             log(f"  Expected: {tag_commit[:16]}...\n")
             return False
             
+    except subprocess.TimeoutExpired:
+        log(f"⚠️  Git verification timed out\n")
+        return False
     except Exception as e:
         log(f"⚠️  Error verifying git commit: {e}\n")
         return False
@@ -166,18 +198,17 @@ def get_optimization_flags(use_aggressive=False):
     if ARCH == "apple_silicon":
         # Apple Silicon (M1/M2/M3) optimizations
         base_flags = [
-            "-mcpu=apple-m1",  # or apple-m2 for newer chips
-            "-O2",              # Safe optimization level
+            "-mcpu=native",
+            "-O2",
             "-fomit-frame-pointer",
             "-fno-common",
         ]
         
         if use_aggressive:
-            # Aggressive optimizations (may break some code)
             aggressive_flags = [
-                "-O3",           # Maximum optimization
-                "-flto",         # Link-time optimization
-                "-march=armv8.5-a+fp16+crypto+dotprod",
+                "-mcpu=native",
+                "-O3",
+                "-flto",
             ]
             flags['CFLAGS'] = ' '.join(base_flags + aggressive_flags)
             flags['CXXFLAGS'] = ' '.join(base_flags + aggressive_flags)
@@ -190,17 +221,16 @@ def get_optimization_flags(use_aggressive=False):
     elif ARCH == "intel":
         # Intel Mac optimizations
         base_flags = [
-            "-march=native",    # Optimize for current CPU
-            "-O2",              # Safe optimization level
+            "-march=native",
+            "-O2",
             "-fomit-frame-pointer",
             "-fno-common",
         ]
         
         if use_aggressive:
-            # Aggressive optimizations
             aggressive_flags = [
-                "-O3",           # Maximum optimization
-                "-flto",         # Link-time optimization
+                "-O3",
+                "-flto",
                 "-mtune=native",
             ]
             flags['CFLAGS'] = ' '.join(base_flags + aggressive_flags)
@@ -224,7 +254,6 @@ def get_rust_optimization_flags(use_aggressive=False):
     
     if use_aggressive:
         # Aggressive Rust optimizations
-        # Note: When using LTO, we must enable embed-bitcode
         flags['RUSTFLAGS'] = '-C opt-level=3 -C target-cpu=native'
         flags['CARGO_PROFILE_RELEASE_LTO'] = 'fat'
         flags['CARGO_PROFILE_RELEASE_OPT_LEVEL'] = '3'
@@ -236,23 +265,44 @@ def get_rust_optimization_flags(use_aggressive=False):
     
     return flags
 
+# ================== GLOBAL GUI VARIABLES ==================
+# These will be set by create_gui()
+root = None
+target_var = None
+cores_var = None
+build_dir_var = None
+bitcoin_version_var = None
+electrs_version_var = None
+bitcoin_combo = None
+electrs_combo = None
+log_text = None
+progress_var = None
+progress = None
+compile_btn = None
+bitcoin_status = None
+electrs_status = None
+aggressive_opts_var = None
+run_tests_var = None
+
 # ================== GUI HELPERS ==================
 def log(msg):
     """Thread-safe logging to GUI text widget"""
-    # Only log if the widget exists (GUI is initialized)
     try:
-        if 'log_text' in globals() and log_text.winfo_exists():
-            log_text.after(0, lambda: (
-                log_text.insert("end", msg),
+        if log_text is not None and log_text.winfo_exists():
+            log_text.after(0, lambda m=msg: (
+                log_text.insert("end", m),
                 log_text.see("end")
             ))
-    except:
-        # Silently fail during initialization
-        pass
+    except (tk.TclError, RuntimeError) as e:
+        print(msg, end='', file=sys.stderr)
 
 def set_progress(val):
     """Thread-safe progress bar update"""
-    progress.after(0, lambda: progress_var.set(val))
+    try:
+        if progress is not None and progress_var is not None:
+            progress.after(0, lambda v=val: progress_var.set(v))
+    except (tk.TclError, RuntimeError):
+        pass
 
 def run_command(cmd, cwd=None, env=None):
     """Execute shell command and log output in real-time"""
@@ -271,20 +321,22 @@ def run_command(cmd, cwd=None, env=None):
         env=env
     )
     
-    for line in process.stdout:
-        log(line)
+    try:
+        for line in process.stdout:
+            log(line)
+    except Exception as e:
+        log(f"Warning: Error reading process output: {e}\n")
     
     process.wait()
     
     if process.returncode != 0:
-        raise RuntimeError(f"Command failed: {cmd}")
+        raise RuntimeError(f"Command failed with exit code {process.returncode}: {cmd}")
     
     return process.returncode
 
 # ================== VERSION LOGIC ==================
 def parse_version(tag):
     """Parse version number from git tag"""
-    # Remove 'v' prefix if present
     tag = tag.lstrip('v')
     m = re.match(r"(\d+)\.(\d+)", tag)
     return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
@@ -300,21 +352,17 @@ def get_bitcoin_versions():
         r = requests.get(BITCOIN_API, timeout=10)
         r.raise_for_status()
         
-        # Collect all non-RC versions
         all_versions = []
         for rel in r.json():
             tag = rel["tag_name"]
-            # Skip release candidates
             if "rc" in tag.lower():
                 continue
             all_versions.append(tag)
-            if len(all_versions) == 20:  # Get more to filter from
+            if len(all_versions) == 20:
                 break
         
-        # Group by major.minor version, keeping only the latest patch
         version_groups = {}
         for tag in all_versions:
-            # Parse version (e.g., "v29.3" -> (29, 3))
             major, minor = parse_version(tag)
             key = f"{major}.{minor}"
             
@@ -322,20 +370,26 @@ def get_bitcoin_versions():
                 version_groups[key] = []
             version_groups[key].append(tag)
         
-        # For each major.minor, keep only the highest patch version
         filtered_versions = []
-        for key in sorted(version_groups.keys(), key=lambda x: tuple(map(int, x.split('.'))), reverse=True):
-            # Sort versions in this group and take the first (latest)
+        try:
+            sorted_keys = sorted(
+                version_groups.keys(), 
+                key=lambda x: tuple(map(int, x.split('.'))), 
+                reverse=True
+            )
+        except (ValueError, AttributeError):
+            sorted_keys = sorted(version_groups.keys(), reverse=True)
+        
+        for key in sorted_keys:
             group = sorted(version_groups[key], key=lambda v: parse_version(v), reverse=True)
             filtered_versions.append(group[0])
-            if len(filtered_versions) == 5:  # Only keep 5 versions
+            if len(filtered_versions) == 5:
                 break
         
         log(f"Found {len(filtered_versions)} Bitcoin versions (latest patch only)\n")
         return filtered_versions
     except Exception as e:
         log(f"Failed to fetch Bitcoin versions: {e}\n")
-        # Return empty list on failure, don't show error dialog during init
         return []
 
 def get_electrs_versions():
@@ -346,17 +400,15 @@ def get_electrs_versions():
         versions = []
         for rel in r.json():
             tag = rel["tag_name"]
-            # Skip release candidates
             if "rc" in tag.lower():
                 continue
             versions.append(tag)
-            if len(versions) == 3:  # Only keep 3 versions
+            if len(versions) == 3:
                 break
         log(f"Found {len(versions)} Electrs versions\n")
         return versions
     except Exception as e:
         log(f"Failed to fetch Electrs versions: {e}\n")
-        # Return empty list on failure, don't show error dialog during init
         return []
 
 # ================== ENVIRONMENT SETUP ==================
@@ -367,29 +419,19 @@ def setup_build_environment(use_aggressive_opts=False):
     if not BREW_PREFIX:
         log("⚠️  Warning: Homebrew prefix not detected, using defaults\n")
     
-    # Build comprehensive PATH
-    path_components = []
+    from collections import OrderedDict
+    path_dict = OrderedDict()
     
-    # Add Homebrew to PATH
     if BREW_PREFIX:
-        path_components.append(f"{BREW_PREFIX}/bin")
+        path_dict[f"{BREW_PREFIX}/bin"] = None
     
-    # Add common Homebrew locations
-    path_components.extend([
-        "/opt/homebrew/bin",
-        "/usr/local/bin"
-    ])
+    path_dict["/opt/homebrew/bin"] = None
+    path_dict["/usr/local/bin"] = None
     
-    # Add Cargo/Rust paths (multiple possible locations)
-    rust_paths = [
-        os.path.expanduser("~/.cargo/bin"),
-        f"{BREW_PREFIX}/bin" if BREW_PREFIX else None,
-    ]
-    for rust_path in rust_paths:
-        if rust_path and os.path.isdir(rust_path):
-            path_components.append(rust_path)
+    cargo_bin = os.path.expanduser("~/.cargo/bin")
+    if os.path.isdir(cargo_bin):
+        path_dict[cargo_bin] = None
     
-    # Add LLVM for Electrs
     llvm_paths = [
         f"{BREW_PREFIX}/opt/llvm/bin" if BREW_PREFIX else None,
         "/opt/homebrew/opt/llvm/bin",
@@ -397,22 +439,14 @@ def setup_build_environment(use_aggressive_opts=False):
     ]
     for llvm_path in llvm_paths:
         if llvm_path and os.path.isdir(llvm_path):
-            path_components.append(llvm_path)
+            path_dict[llvm_path] = None
     
-    # Add existing PATH
-    path_components.append(env.get('PATH', ''))
+    for p in env.get('PATH', '').split(':'):
+        if p:
+            path_dict[p] = None
     
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_paths = []
-    for p in path_components:
-        if p and p not in seen:
-            seen.add(p)
-            unique_paths.append(p)
+    env["PATH"] = ":".join(path_dict.keys())
     
-    env["PATH"] = ":".join(unique_paths)
-    
-    # LLVM setup for Electrs
     llvm_lib_paths = [
         f"{BREW_PREFIX}/opt/llvm" if BREW_PREFIX else None,
         "/opt/homebrew/opt/llvm",
@@ -424,15 +458,11 @@ def setup_build_environment(use_aggressive_opts=False):
             env["DYLD_LIBRARY_PATH"] = f"{llvm_prefix}/lib"
             break
     
-    # Add optimization flags
     opt_flags = get_optimization_flags(use_aggressive_opts)
     for key, value in opt_flags.items():
-        if value:  # Only set non-empty values
+        if value:
             env[key] = value
             log(f"  {key}: {value}\n")
-    
-    # Note: Berkeley DB is NOT configured here as it's only needed for legacy wallet support
-    # For running a Bitcoin node (bitcoind), wallet support is disabled in the build
     
     return env
 
@@ -441,16 +471,15 @@ def check_rust_installation():
     """Comprehensive Rust/Cargo check and installation"""
     log("\n=== Checking Rust Toolchain ===\n")
     
-    # Possible Rust installation paths
-    rust_paths = [
-        os.path.expanduser("~/.cargo/bin"),
-        f"{BREW_PREFIX}/bin" if BREW_PREFIX else None,
-        "/usr/local/bin",
-        "/opt/homebrew/bin"
-    ]
-    rust_paths = [p for p in rust_paths if p]  # Remove None values
+    from collections import OrderedDict
+    rust_paths_dict = OrderedDict()
+    rust_paths_dict[os.path.expanduser("~/.cargo/bin")] = None
+    if BREW_PREFIX:
+        rust_paths_dict[f"{BREW_PREFIX}/bin"] = None
+    rust_paths_dict["/usr/local/bin"] = None
+    rust_paths_dict["/opt/homebrew/bin"] = None
+    rust_paths = list(rust_paths_dict.keys())
     
-    # Check if rustc is accessible
     rustc_found = False
     cargo_found = False
     rustc_path = None
@@ -461,12 +490,12 @@ def check_rust_installation():
         cargo_candidate = os.path.join(path, "cargo")
         
         if os.path.isfile(rustc_candidate) and not rustc_found:
-            # Test if it works
             result = subprocess.run(
                 [rustc_candidate, "--version"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                timeout=10
             )
             if result.returncode == 0:
                 rustc_found = True
@@ -479,7 +508,8 @@ def check_rust_installation():
                 [cargo_candidate, "--version"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                timeout=10
             )
             if result.returncode == 0:
                 cargo_found = True
@@ -487,29 +517,26 @@ def check_rust_installation():
                 log(f"✓ cargo found at: {cargo_path}\n")
                 log(f"  Version: {result.stdout.strip()}\n")
     
-    # If not found, install Rust via Homebrew
     if not rustc_found or not cargo_found:
         log("\n❌ Rust toolchain not found or incomplete!\n")
         log("Installing Rust via Homebrew...\n")
         
         try:
-            # First, check if rust formula exists
             result = subprocess.run(
                 [BREW, "info", "rust"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                timeout=30
             )
             
             if result.returncode == 0:
                 log("📦 Installing rust from Homebrew...\n")
                 run_command(f"{BREW} install rust")
                 
-                # Verify installation
                 log("\nVerifying Rust installation...\n")
-                time.sleep(2)  # Give it a moment
+                time.sleep(2)
                 
-                # Check again
                 for path in rust_paths:
                     rustc_candidate = os.path.join(path, "rustc")
                     cargo_candidate = os.path.join(path, "cargo")
@@ -519,7 +546,8 @@ def check_rust_installation():
                             [rustc_candidate, "--version"],
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
-                            text=True
+                            text=True,
+                            timeout=10
                         )
                         if result.returncode == 0:
                             log(f"✓ rustc installed successfully: {result.stdout.strip()}\n")
@@ -533,7 +561,8 @@ def check_rust_installation():
                             [cargo_candidate, "--version"],
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
-                            text=True
+                            text=True,
+                            timeout=10
                         )
                         if result.returncode == 0:
                             log(f"✓ cargo installed successfully: {result.stdout.strip()}\n")
@@ -562,6 +591,9 @@ def check_rust_installation():
                     "3. Restart this app"
                 )
                 
+        except subprocess.TimeoutExpired:
+            log(f"❌ Rust installation timed out\n")
+            messagebox.showerror("Installation Timeout", "Rust installation timed out")
         except Exception as e:
             log(f"❌ Failed to install Rust: {e}\n")
             messagebox.showerror(
@@ -587,9 +619,6 @@ def check_dependencies():
             log(f"✓ Homebrew found at: {BREW}\n")
             log(f"  Homebrew prefix: {BREW_PREFIX}\n")
 
-            # Required Homebrew packages (excluding rust, we check that separately)
-            # Note: berkeley-db@4 is only needed for wallet support, not for running a node
-            # Added git to the list of required packages
             brew_packages = [
                 "automake", "libtool", "pkg-config", "boost",
                 "miniupnpc", "zeromq", "sqlite", "python", "cmake", "llvm", "libevent", "rocksdb", "rust", "git"
@@ -602,7 +631,8 @@ def check_dependencies():
                     [BREW, "list", pkg],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    text=True
+                    text=True,
+                    timeout=10
                 )
                 if result.returncode != 0:
                     log(f"  ❌ {pkg} - not installed\n")
@@ -613,10 +643,9 @@ def check_dependencies():
             if missing:
                 log(f"\n⚠️  Missing Homebrew packages: {', '.join(missing)}\n")
                 
-                # Create a simple, safe message for the dialog
                 try:
                     pkg_count = len(missing)
-                    pkg_list = ', '.join(missing[:5])  # Show first 5 packages
+                    pkg_list = ', '.join(missing[:5])
                     if pkg_count > 5:
                         pkg_list += f", and {pkg_count - 5} more"
                     
@@ -629,7 +658,6 @@ def check_dependencies():
                     install_deps = messagebox.askyesno("Install Missing Dependencies", message)
                 except Exception as e:
                     log(f"⚠️  Error showing dialog: {e}\n")
-                    # Fallback: ask in a simpler way
                     install_deps = messagebox.askyesno(
                         "Install Dependencies",
                         f"Install {len(missing)} missing packages?"
@@ -644,15 +672,14 @@ def check_dependencies():
                         except Exception as e:
                             log(f"❌ Failed to install {pkg}: {e}\n")
                             try:
-                                messagebox.showerror("Installation Failed", f"Failed to install {pkg}")
-                            except:
-                                log("⚠️  Could not show error dialog\n")
+                                messagebox.showerror("Installation Failed", f"Failed to install {pkg}: {str(e)}")
+                            except Exception as dialog_error:
+                                log(f"⚠️  Could not show error dialog: {dialog_error}\n")
                 else:
                     log("\n⚠️  Dependencies not installed. Compilation may fail.\n")
             else:
                 log("\n✓ All Homebrew packages are installed!\n")
 
-            # Comprehensive Rust check
             rust_ok = check_rust_installation()
             
             if rust_ok:
@@ -676,6 +703,9 @@ def check_dependencies():
                     "You may need to restart the app after installing Rust."
                 )
 
+        except subprocess.TimeoutExpired as e:
+            log(f"\n❌ Timeout during dependency check: {e}\n")
+            messagebox.showerror("Timeout", "Dependency check timed out")
         except Exception as e:
             log(f"\n❌ Error during dependency check: {e}\n")
             import traceback
@@ -690,7 +720,6 @@ def refresh_bitcoin_versions():
     versions = get_bitcoin_versions()
     if versions:
         bitcoin_combo.configure(values=versions)
-        # Always set to the first (newest) version
         bitcoin_version_var.set(versions[0])
         log(f"✓ Loaded {len(versions)} Bitcoin versions (selected: {versions[0]})\n")
     else:
@@ -703,7 +732,6 @@ def refresh_electrs_versions():
     versions = get_electrs_versions()
     if versions:
         electrs_combo.configure(values=versions)
-        # Always set to the first (newest) version
         electrs_version_var.set(versions[0])
         log(f"✓ Loaded {len(versions)} Electrs versions (selected: {versions[0]})\n")
     else:
@@ -716,24 +744,6 @@ def initial_version_load():
         refresh_bitcoin_versions()
         refresh_electrs_versions()
     threading.Thread(target=task, daemon=True).start()
-
-# ================== GLOBAL GUI VARIABLES ==================
-# These will be set by create_gui()
-root = None
-target_var = None
-cores_var = None
-build_dir_var = None
-bitcoin_version_var = None
-electrs_version_var = None
-bitcoin_combo = None
-electrs_combo = None
-log_text = None
-progress_var = None
-progress = None
-compile_btn = None
-bitcoin_status = None
-electrs_status = None
-aggressive_opts_var = None
 
 # ================== BUILD FUNCTIONS ==================
 def copy_binaries(src_dir, dest_dir, binary_files):
@@ -748,7 +758,6 @@ def copy_binaries(src_dir, dest_dir, binary_files):
             try:
                 dest = os.path.join(dest_dir, os.path.basename(binary))
                 shutil.copy2(binary, dest)
-                # Make executable
                 os.chmod(dest, 0o755)
                 copied.append(dest)
                 log(f"✓ Copied: {os.path.basename(binary)} → {dest}\n")
@@ -761,6 +770,77 @@ def copy_binaries(src_dir, dest_dir, binary_files):
         log(f"❌ WARNING: No binaries were copied!\n")
     
     return copied
+
+# ================== UNIT TESTING FUNCTIONS ==================
+def run_bitcoin_tests(src_dir, version, use_cmake_build):
+    """Run Bitcoin Core unit tests"""
+    try:
+        log(f"\n{'='*60}\n")
+        log(f"RUNNING BITCOIN CORE {version} UNIT TESTS\n")
+        log(f"{'='*60}\n")
+        
+        env = setup_build_environment(False)
+        
+        if use_cmake_build:
+            log("Running tests via ctest...\n")
+            test_dir = os.path.join(src_dir, "build")
+            
+            try:
+                run_command("ctest --output-on-failure", cwd=test_dir, env=env)
+                log(f"\n✅ Bitcoin Core {version} tests PASSED!\n")
+                return True
+            except RuntimeError as e:
+                log(f"\n❌ Bitcoin Core {version} tests FAILED!\n")
+                log(f"Error: {e}\n")
+                return False
+        else:
+            log("Running tests via 'make check'...\n")
+            
+            try:
+                run_command("make check", cwd=src_dir, env=env)
+                log(f"\n✅ Bitcoin Core {version} tests PASSED!\n")
+                return True
+            except RuntimeError as e:
+                log(f"\n❌ Bitcoin Core {version} tests FAILED!\n")
+                log(f"Error: {e}\n")
+                return False
+                
+    except Exception as e:
+        log(f"\n❌ Error running Bitcoin tests: {e}\n")
+        import traceback
+        log(f"\nFull traceback:\n{traceback.format_exc()}\n")
+        return False
+
+def run_electrs_tests(src_dir, version):
+    """Run Electrs unit tests"""
+    try:
+        log(f"\n{'='*60}\n")
+        log(f"RUNNING ELECTRS {version} UNIT TESTS\n")
+        log(f"{'='*60}\n")
+        
+        env = setup_build_environment(False)
+        
+        rust_flags = get_rust_optimization_flags(False)
+        for key, value in rust_flags.items():
+            if value:
+                env[key] = value
+        
+        log("Running tests via 'cargo test --release'...\n")
+        
+        try:
+            run_command("cargo test --release", cwd=src_dir, env=env)
+            log(f"\n✅ Electrs {version} tests PASSED!\n")
+            return True
+        except RuntimeError as e:
+            log(f"\n❌ Electrs {version} tests FAILED!\n")
+            log(f"Error: {e}\n")
+            return False
+            
+    except Exception as e:
+        log(f"\n❌ Error running Electrs tests: {e}\n")
+        import traceback
+        log(f"\nFull traceback:\n{traceback.format_exc()}\n")
+        return False
 
 def compile_bitcoin_source(version, build_dir, cores, use_aggressive_opts=False):
     """Compile Bitcoin Core from source using git clone"""
@@ -775,10 +855,8 @@ def compile_bitcoin_source(version, build_dir, cores, use_aggressive_opts=False)
         version_clean = version.lstrip('v')
         src_dir = os.path.join(build_dir, f"bitcoin-{version_clean}")
         
-        # Create build directory
         os.makedirs(build_dir, exist_ok=True)
         
-        # Clone or update source from GitHub
         if not os.path.exists(src_dir):
             log(f"\n📥 Cloning Bitcoin Core repository...\n")
             run_command(
@@ -793,12 +871,10 @@ def compile_bitcoin_source(version, build_dir, cores, use_aggressive_opts=False)
             run_command(f"git checkout {version}", cwd=src_dir)
             log(f"✓ Updated to {version}\n")
 
-        # Verify source integrity
         if not verify_source_integrity(src_dir, "Bitcoin Core", version):
             log("❌ User cancelled due to verification failure\n")
             raise RuntimeError("Source verification failed")
 
-        # Setup environment with optimization flags
         env = setup_build_environment(use_aggressive_opts)
         
         log(f"\nEnvironment setup:\n")
@@ -811,19 +887,18 @@ def compile_bitcoin_source(version, build_dir, cores, use_aggressive_opts=False)
             log(f"  LDFLAGS: {env['LDFLAGS']}\n")
         log(f"  Building node-only (wallet support disabled)\n")
         
-        # Determine build method
-        if use_cmake(version):
+        uses_cmake = use_cmake(version)
+        
+        if uses_cmake:
             log(f"\n🔨 Building with CMake (Bitcoin Core {version})...\n")
-            build_subdir = os.path.join(src_dir, "build")
             
-            cmake_cmd = f"cmake -B build -DENABLE_WALLET=OFF -DENABLE_IPC=OFF"
-            log(f"\n⚙️  Configuring (wallet support disabled for node-only build)...\n")
+            cmake_cmd = f"cmake -B build -DENABLE_WALLET=OFF -DENABLE_IPC=OFF -DBUILD_TESTS=ON"
+            log(f"\n⚙️  Configuring (wallet support disabled, tests enabled)...\n")
             run_command(cmake_cmd, cwd=src_dir, env=env)
             
             log(f"\n🔧 Compiling with {cores} cores...\n")
             run_command(f"cmake --build build -j{cores}", cwd=src_dir, env=env)
             
-            # Binary locations for CMake build
             build_subdir = os.path.join(src_dir, "build")
             binary_dir = os.path.join(build_subdir, "bin")
             binaries = [
@@ -837,10 +912,10 @@ def compile_bitcoin_source(version, build_dir, cores, use_aggressive_opts=False)
         else:
             log(f"\n🔨 Building with Autotools (Bitcoin Core {version})...\n")
             
-            # Configure options - disable wallet support for node-only build
             config_opts = [
-                "--disable-wallet",  # Disable wallet (no Berkeley DB needed)
-                "--disable-gui",     # Disable GUI
+                "--disable-wallet",
+                "--disable-gui",
+                "--enable-tests",
             ]
             
             config_cmd = f"./configure {' '.join(config_opts)}"
@@ -848,13 +923,12 @@ def compile_bitcoin_source(version, build_dir, cores, use_aggressive_opts=False)
             log(f"\n⚙️  Running autogen.sh...\n")
             run_command("./autogen.sh", cwd=src_dir, env=env)
             
-            log(f"\n⚙️  Configuring (wallet support disabled for node-only build)...\n")
+            log(f"\n⚙️  Configuring (wallet support disabled, tests enabled)...\n")
             run_command(config_cmd, cwd=src_dir, env=env)
             
             log(f"\n🔧 Compiling with {cores} cores...\n")
             run_command(f"make -j{cores}", cwd=src_dir, env=env)
             
-            # Binary locations for Autotools build
             binary_dir = os.path.join(src_dir, "bin")
             binaries = [
                 os.path.join(binary_dir, "bitcoind"),
@@ -863,7 +937,6 @@ def compile_bitcoin_source(version, build_dir, cores, use_aggressive_opts=False)
                 os.path.join(binary_dir, "bitcoin-wallet"),
             ]
         
-        # Copy binaries to output directory
         log(f"\n📋 Collecting binaries...\n")
         output_dir = os.path.join(build_dir, "binaries", f"bitcoin-{version_clean}")
         copied = copy_binaries(src_dir, output_dir, binaries)
@@ -880,7 +953,11 @@ def compile_bitcoin_source(version, build_dir, cores, use_aggressive_opts=False)
         log(f"\n📍 Binaries location: {output_dir}\n")
         log(f"   Found {len(copied)} binaries\n\n")
         
-        return output_dir
+        return {
+            'output_dir': output_dir,
+            'src_dir': src_dir,
+            'uses_cmake': uses_cmake
+        }
 
     except Exception as e:
         log(f"\n❌ Error compiling Bitcoin: {e}\n")
@@ -898,27 +975,31 @@ def compile_electrs_source(version, build_dir, cores, use_aggressive_opts=False)
         log(f"Optimization: {'AGGRESSIVE (O3 + LTO)' if use_aggressive_opts else 'STANDARD (O2)'}\n")
         log(f"{'='*60}\n")
         
-        # Setup environment with LLVM and Rust optimization flags
         env = setup_build_environment(use_aggressive_opts)
         
-        # Add Rust-specific optimization flags
         rust_flags = get_rust_optimization_flags(use_aggressive_opts)
         for key, value in rust_flags.items():
             if value:
                 env[key] = value
                 log(f"  {key}: {value}\n")
         
-        # Verify Rust is available before proceeding
         log("\n🔍 Verifying Rust installation...\n")
-        cargo_check = subprocess.run(
-            ["cargo", "--version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env
-        )
+        try:
+            cargo_check = subprocess.run(
+                ["cargo", "--version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                timeout=10
+            )
+        except subprocess.TimeoutExpired:
+            log("❌ Cargo check timed out\n")
+            cargo_check = None
+        except FileNotFoundError:
+            cargo_check = None
         
-        if cargo_check.returncode != 0:
+        if cargo_check is None or cargo_check.returncode != 0:
             error_msg = (
                 "❌ Cargo not found in PATH!\n\n"
                 "Electrs requires Rust/Cargo to compile.\n\n"
@@ -934,26 +1015,28 @@ def compile_electrs_source(version, build_dir, cores, use_aggressive_opts=False)
         
         log(f"✓ Cargo found: {cargo_check.stdout.strip()}\n")
         
-        rustc_check = subprocess.run(
-            ["rustc", "--version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env
-        )
-        
-        if rustc_check.returncode == 0:
-            log(f"✓ Rustc found: {rustc_check.stdout.strip()}\n")
-        else:
+        try:
+            rustc_check = subprocess.run(
+                ["rustc", "--version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                timeout=10
+            )
+            
+            if rustc_check.returncode == 0:
+                log(f"✓ Rustc found: {rustc_check.stdout.strip()}\n")
+            else:
+                log("⚠️  Warning: rustc check failed, but cargo found. Proceeding...\n")
+        except (subprocess.TimeoutExpired, FileNotFoundError):
             log("⚠️  Warning: rustc check failed, but cargo found. Proceeding...\n")
         
         version_clean = version.lstrip('v')
         src_dir = os.path.join(build_dir, f"electrs-{version_clean}")
         
-        # Create build directory
         os.makedirs(build_dir, exist_ok=True)
         
-        # Clone or update source from GitHub
         if not os.path.exists(src_dir):
             log(f"\n📥 Cloning Electrs repository...\n")
             run_command(
@@ -969,7 +1052,6 @@ def compile_electrs_source(version, build_dir, cores, use_aggressive_opts=False)
             run_command(f"git checkout {version}", cwd=src_dir, env=env)
             log(f"✓ Updated to {version}\n")
         
-        # Verify source integrity
         if not verify_source_integrity(src_dir, "Electrs", version):
             log("❌ User cancelled due to verification failure\n")
             raise RuntimeError("Source verification failed")
@@ -984,7 +1066,6 @@ def compile_electrs_source(version, build_dir, cores, use_aggressive_opts=False)
         
         run_command(f"cargo build --release --jobs {cores}", cwd=src_dir, env=env)
         
-        # Copy binary
         log(f"\n📋 Collecting binaries...\n")
         binary = os.path.join(src_dir, "target", "release", "electrs")
         
@@ -999,7 +1080,10 @@ def compile_electrs_source(version, build_dir, cores, use_aggressive_opts=False)
         log(f"{'='*60}\n")
         log(f"\n📍 Binary location: {output_dir}/electrs\n\n")
         
-        return output_dir
+        return {
+            'output_dir': output_dir,
+            'src_dir': src_dir
+        }
 
     except Exception as e:
         log(f"\n❌ Error compiling Electrs: {e}\n")
@@ -1015,13 +1099,13 @@ def compile_selected():
     bitcoin_ver = bitcoin_version_var.get()
     electrs_ver = electrs_version_var.get()
     use_aggressive = aggressive_opts_var.get()
+    run_tests = run_tests_var.get()
 
     def task():
         try:
             set_progress(0)
             compile_btn.config(state="disabled")
             
-            # Show warning if aggressive optimizations are enabled
             if use_aggressive:
                 response = messagebox.askyesno(
                     "Aggressive Optimizations Enabled",
@@ -1038,7 +1122,6 @@ def compile_selected():
                     log("\n❌ User cancelled compilation due to aggressive optimization warning\n")
                     return
             
-            # Validate versions are loaded
             if target in ["Bitcoin", "Both"]:
                 if not bitcoin_ver or bitcoin_ver == "Loading...":
                     messagebox.showerror("Error", "Please wait for Bitcoin versions to load, or click Refresh")
@@ -1049,26 +1132,75 @@ def compile_selected():
                     messagebox.showerror("Error", "Please wait for Electrs versions to load, or click Refresh")
                     return
             
-            output_dirs = []
+            bitcoin_result = None
+            electrs_result = None
+            bitcoin_test_passed = None
+            electrs_test_passed = None
             
             if target in ["Bitcoin", "Both"]:
                 set_progress(10)
-                output_dir = compile_bitcoin_source(bitcoin_ver, build_dir, cores, use_aggressive)
-                output_dirs.append(output_dir)
-                set_progress(50)
+                bitcoin_result = compile_bitcoin_source(bitcoin_ver, build_dir, cores, use_aggressive)
+                set_progress(45 if target == "Both" else 90)
             
             if target in ["Electrs", "Both"]:
-                set_progress(60 if target == "Both" else 10)
-                output_dir = compile_electrs_source(electrs_ver, build_dir, cores, use_aggressive)
-                output_dirs.append(output_dir)
-                set_progress(100)
+                set_progress(50 if target == "Both" else 10)
+                electrs_result = compile_electrs_source(electrs_ver, build_dir, cores, use_aggressive)
+                set_progress(90)
+            
+            if run_tests:
+                log(f"\n{'='*60}\n")
+                log("RUNNING UNIT TESTS\n")
+                log(f"{'='*60}\n")
+                
+                if bitcoin_result:
+                    set_progress(92)
+                    bitcoin_test_passed = run_bitcoin_tests(
+                        bitcoin_result['src_dir'],
+                        bitcoin_ver,
+                        bitcoin_result['uses_cmake']
+                    )
+                
+                if electrs_result:
+                    set_progress(96)
+                    electrs_test_passed = run_electrs_tests(
+                        electrs_result['src_dir'],
+                        electrs_ver
+                    )
             
             set_progress(100)
             
             msg = f"✅ {target} compilation completed successfully!\n\n"
+            
             msg += "Binaries saved to:\n"
-            for d in output_dirs:
-                msg += f"• {d}\n"
+            if bitcoin_result:
+                msg += f"• Bitcoin: {bitcoin_result['output_dir']}\n"
+            if electrs_result:
+                msg += f"• Electrs: {electrs_result['output_dir']}\n"
+            
+            if run_tests:
+                msg += "\n" + "="*40 + "\n"
+                msg += "UNIT TEST RESULTS:\n"
+                msg += "="*40 + "\n"
+                
+                if bitcoin_test_passed is not None:
+                    status = "✅ PASSED" if bitcoin_test_passed else "❌ FAILED"
+                    msg += f"Bitcoin Core {bitcoin_ver}: {status}\n"
+                
+                if electrs_test_passed is not None:
+                    status = "✅ PASSED" if electrs_test_passed else "❌ FAILED"
+                    msg += f"Electrs {electrs_ver}: {status}\n"
+                
+                all_passed = True
+                if bitcoin_test_passed is not None and not bitcoin_test_passed:
+                    all_passed = False
+                if electrs_test_passed is not None and not electrs_test_passed:
+                    all_passed = False
+                
+                if all_passed:
+                    msg += "\n✅ All tests PASSED! Binaries are ready to use.\n"
+                else:
+                    msg += "\n⚠️  Some tests FAILED! Review the log for details.\n"
+                    msg += "Binaries were compiled but may have issues.\n"
             
             messagebox.showinfo("Compilation Complete", msg)
             
@@ -1086,23 +1218,27 @@ def create_gui():
     """Create and configure the main GUI window"""
     global root, target_var, cores_var, build_dir_var, bitcoin_version_var, electrs_version_var
     global bitcoin_combo, electrs_combo, log_text, progress_var, progress, compile_btn
-    global bitcoin_status, electrs_status, aggressive_opts_var
+    global bitcoin_status, electrs_status, aggressive_opts_var, run_tests_var
     
     root = tk.Tk()
     root.title("Bitcoin & Electrs Compiler for macOS")
-    root.geometry("900x850")
+    root.geometry("900x800")
     
-    # Prevent window from being created multiple times
+    # Make window resizable
+    root.resizable(True, True)
+    
+    # Set minimum size
+    root.minsize(800, 600)
+    
     root.protocol("WM_DELETE_WINDOW", lambda: root.quit())
     
-    # macOS specific: bring to front
     if platform.system() == 'Darwin':
         try:
             root.lift()
             root.attributes('-topmost', True)
             root.after_idle(root.attributes, '-topmost', False)
-        except:
-            pass
+        except tk.TclError as e:
+            log(f"Warning: Could not set window attributes: {e}\n")
     
     # Header
     header = ttk.Label(
@@ -1112,10 +1248,16 @@ def create_gui():
     )
     header.pack(pady=10)
     
-    # Architecture info
-    arch_text = f"Architecture: {ARCH.upper()}" + (
-        " (Apple Silicon)" if ARCH == "apple_silicon" else " (Intel Mac)" if ARCH == "intel" else ""
-    )
+    # Architecture info - improved display
+    if ARCH == "apple_silicon" and CHIP_NAME:
+        arch_text = f"Architecture: Apple Silicon ({CHIP_NAME})"
+    elif ARCH == "apple_silicon":
+        arch_text = "Architecture: Apple Silicon"
+    elif ARCH == "intel":
+        arch_text = "Architecture: Intel Mac"
+    else:
+        arch_text = f"Architecture: {ARCH}"
+    
     arch_label = ttk.Label(root, text=arch_text, font=("Arial", 10))
     arch_label.pack()
     
@@ -1175,26 +1317,36 @@ def create_gui():
         command=lambda: build_dir_var.set(filedialog.askdirectory(initialdir=build_dir_var.get()))
     ).grid(row=1, column=4, padx=5, pady=5)
     
-    # Optimization options
-    opt_frame = ttk.LabelFrame(root, text="Step 2.5: Optimization Settings", padding=10)
+    # Optimization and Testing options (COMBINED)
+    opt_frame = ttk.LabelFrame(root, text="Step 2.5: Optimization & Testing", padding=10)
     opt_frame.pack(fill="x", padx=20, pady=5)
     
+    # Aggressive optimization checkbox
     aggressive_opts_var = tk.BooleanVar(value=False)
     aggressive_check = ttk.Checkbutton(
         opt_frame,
         text="⚡ Enable Aggressive Optimizations (O3 + LTO) - May break code, use with caution!",
         variable=aggressive_opts_var
     )
-    aggressive_check.pack(anchor="w", padx=5, pady=5)
+    aggressive_check.pack(anchor="w", padx=5, pady=2)
     
+    # Unit testing checkbox
+    run_tests_var = tk.BooleanVar(value=False)
+    test_check = ttk.Checkbutton(
+        opt_frame,
+        text="🧪 Run Unit Tests After Compilation - Validates compiled binaries are functional",
+        variable=run_tests_var
+    )
+    test_check.pack(anchor="w", padx=5, pady=2)
+    
+    # Info label
     opt_info = ttk.Label(
         opt_frame,
-        text="ℹ️  Standard build uses O2 optimizations. Aggressive mode adds O3 and Link-Time Optimization.\n"
-             "   Aggressive optimizations may significantly increase compile time and could introduce bugs.",
+        text="ℹ️  Optimizations: Standard (O2) vs Aggressive (O3+LTO). Tests add 5-20 min to build time.",
         font=("Arial", 9),
         foreground="gray"
     )
-    opt_info.pack(anchor="w", padx=5, pady=(0, 5))
+    opt_info.pack(anchor="w", padx=5, pady=(2, 5))
     
     # Version selection
     version_frame = ttk.LabelFrame(root, text="Step 3: Select Versions", padding=10)
@@ -1242,7 +1394,17 @@ def create_gui():
     progress = ttk.Progressbar(progress_frame, variable=progress_var, maximum=100)
     progress.pack(fill="x", pady=5)
     
-    # Log terminal
+    # Compile button - moved before log for visibility
+    button_frame = ttk.Frame(root)
+    button_frame.pack(pady=10)
+    compile_btn = ttk.Button(
+        button_frame,
+        text="🚀 Start Compilation",
+        command=compile_selected
+    )
+    compile_btn.pack()
+    
+    # Log terminal (TALLER)
     log_frame = ttk.LabelFrame(root, text="Build Log", padding=5)
     log_frame.pack(fill="both", expand=True, padx=20, pady=5)
     
@@ -1251,7 +1413,7 @@ def create_gui():
     
     log_text = tk.Text(
         log_text_frame,
-        height=15,
+        height=20,  # Increased from 15
         wrap="none",
         bg="#1e1e1e",
         fg="#00ff00",
@@ -1267,22 +1429,12 @@ def create_gui():
     scrollbar_x.pack(fill="x")
     log_text.config(xscrollcommand=scrollbar_x.set)
     
-    # Compile button
-    button_frame = ttk.Frame(root)
-    button_frame.pack(pady=10)
-    compile_btn = ttk.Button(
-        button_frame,
-        text="🚀 Start Compilation",
-        command=compile_selected
-    )
-    compile_btn.pack()
-    
     # Status bar
     status_frame = ttk.Frame(root)
     status_frame.pack(fill="x", side="bottom")
     status_text = (
         f"System: macOS {platform.mac_ver()[0]} | "
-        f"Arch: {ARCH} | "
+        f"Arch: {CHIP_NAME if CHIP_NAME else ARCH} | "
         f"Homebrew: {BREW_PREFIX if BREW_PREFIX else 'Not Found'} | "
         f"CPUs: {multiprocessing.cpu_count()}"
     )
@@ -1299,7 +1451,10 @@ def create_gui():
     log("Bitcoin Core & Electrs Compiler\n")
     log("=" * 60 + "\n")
     log(f"System: macOS {platform.mac_ver()[0]}\n")
-    log(f"Architecture: {ARCH}\n")
+    if CHIP_NAME:
+        log(f"Architecture: Apple Silicon ({CHIP_NAME})\n")
+    else:
+        log(f"Architecture: {ARCH}\n")
     log(f"Homebrew: {BREW_PREFIX if BREW_PREFIX else 'Not Found'}\n")
     log(f"CPU Cores: {multiprocessing.cpu_count()}\n")
     if is_pyinstaller():
@@ -1307,11 +1462,13 @@ def create_gui():
     log("=" * 60 + "\n\n")
     log("🔧 Features:\n")
     log("  • Architecture-specific optimizations\n")
-    log("  • SHA256 source verification\n")
-    log("  • Optional aggressive O3 + LTO optimizations\n\n")
+    log("  • Git commit source verification\n")
+    log("  • Optional aggressive O3 + LTO optimizations\n")
+    log("  • Unit test support for validation\n\n")
     log("👉 Click 'Check & Install Dependencies' to begin\n\n")
-    log("📝 Note: Both Bitcoin and Electrs now pull source from GitHub\n")
-    log("🔐 Note: Source integrity is verified using git commit hashes\n\n")
+    log("📝 Note: Both Bitcoin and Electrs pull source from GitHub\n")
+    log("🔐 Note: Source integrity is verified using git commit hashes\n")
+    log("🧪 Note: Unit tests can be run to validate compiled binaries\n\n")
     
     # Load versions after GUI is ready
     root.after(100, initial_version_load)
@@ -1324,34 +1481,28 @@ def main():
     global root
     
     try:
-        # Create the GUI
         root = create_gui()
-        
-        # Start the GUI event loop
         root.mainloop()
     except KeyboardInterrupt:
         print("\nApplication interrupted by user")
         sys.exit(0)
     except Exception as e:
-        # Log any uncaught exceptions
         error_msg = f"Fatal error: {e}\n"
         print(error_msg, file=sys.stderr)
         import traceback
         traceback.print_exc()
         
-        # Try to show error dialog if possible
         try:
             messagebox.showerror(
                 "Fatal Error",
                 f"Application crashed:\n\n{e}\n\nCheck console for details."
             )
-        except:
-            pass
+        except Exception as dialog_error:
+            print(f"Could not show error dialog: {dialog_error}", file=sys.stderr)
         
         sys.exit(1)
 
 if __name__ == "__main__":
-    # Prevent re-execution in frozen apps
     if is_pyinstaller():
         multiprocessing.freeze_support()
     
